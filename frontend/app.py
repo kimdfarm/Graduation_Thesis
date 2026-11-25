@@ -5,11 +5,11 @@ from dotenv import load_dotenv
 import requests
 import streamlit as st
 
-from tab_stage2 import render_stage2
-from tab_stage3 import render_stage3
-from tab_stage4 import render_stage4
-from ui_constants import EXPERIMENT_DIR, TRACE_FILE
-from ui_state import clear_trace, load_trace, restore_session_from_trace, save_trace
+from frontend.tab_stage2 import render_stage2
+from frontend.tab_stage3 import render_stage3
+from frontend.tab_stage4 import render_stage4
+from frontend.ui_constants import EXPERIMENT_DIR, TRACE_FILE
+from frontend.ui_state import clear_trace, load_trace, restore_session_from_trace, save_trace
 
 load_dotenv()
 ENV_GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()

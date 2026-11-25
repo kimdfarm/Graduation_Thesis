@@ -4,7 +4,7 @@ from typing import Any
 
 import streamlit as st
 
-from ui_constants import EXPERIMENT_DIR, TRACE_FILE
+from frontend.ui_constants import EXPERIMENT_DIR, TRACE_FILE
 
 
 def load_trace() -> dict[str, Any]:

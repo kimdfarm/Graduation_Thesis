@@ -6,13 +6,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from csv_exporter import (
+from frontend.csv_exporter import (
     flatten_generated_sections_to_df,
     flatten_sub_outputs_to_df,
     format_card_value_html,
     save_run_to_csvs,
 )
-from ui_constants import (
+from frontend.ui_constants import (
     ALL_EXPLORE_TYPES,
     FINAL_BASE_PROMPT_TEMPLATE,
     SUB_BASE_PROMPT_TEMPLATE,
@@ -20,7 +20,7 @@ from ui_constants import (
     compute_ui_sub_budgets,
     count_ui_tokens,
 )
-from ui_state import load_trace, save_trace
+from frontend.ui_state import load_trace, save_trace
 
 
 def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: Any) -> None:
