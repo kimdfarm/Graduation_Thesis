@@ -21,6 +21,7 @@ from llm_pipeline import (
     FALLBACK_MODEL_NAME,
     PRIMARY_MODEL_NAME,
     STRICT_ANALYSIS_SYSTEM_PROMPT,
+    GROQ_API_KEY,
     add_usage,
     ai_intelligent_preprocess,
     build_chunk_preview_data,
