@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from frontend.ui_constants import EXPERIMENT_DIR, SUMMARY_CSV_PATH
+from ui_constants import EXPERIMENT_DIR, SUMMARY_CSV_PATH
 
 
 def render_stage4() -> None:

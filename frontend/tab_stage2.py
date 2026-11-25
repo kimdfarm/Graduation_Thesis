@@ -3,8 +3,8 @@ from typing import Any
 import requests
 import streamlit as st
 
-from frontend.ui_constants import EXPLORE_LABELS, GITHUB_TEMPLATE_PRESETS
-from frontend.ui_state import load_trace, save_trace
+from ui_constants import EXPLORE_LABELS, GITHUB_TEMPLATE_PRESETS
+from ui_state import load_trace, save_trace
 
 
 def render_stage2(backend_url: str, github_token: str, github_id: str, start_date: Any, end_date: Any) -> None:

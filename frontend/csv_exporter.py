@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from frontend.ui_constants import EXPERIMENT_DIR, SUMMARY_CSV_PATH
+from ui_constants import EXPERIMENT_DIR, SUMMARY_CSV_PATH
 
 
 def format_card_value_html(val: Any) -> str:
