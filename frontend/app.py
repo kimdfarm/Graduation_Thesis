@@ -10,15 +10,17 @@ import requests
 import streamlit as st
 import tiktoken
 
-FINAL_BASE_PROMPT_TEMPLATE = """You are a strict technical evidence extractor and developer resume structuring engine.
-Your job is to transform GitHub repository activity (commits, PRs, issues, languages) into structured JSON for engineering evaluation.
+FINAL_BASE_PROMPT_TEMPLATE = """You are an expert developer resume formatting and structuring engine.
 
-STRICT ANTI-HALLUCINATION & RIGOR RULES:
-1. ZERO FABRICATION: Every technical claim, architecture decision, library/framework name, metric, or outcome MUST be directly grounded in the provided input data. If a detail is not present in the input, DO NOT invent or guess it.
-2. HIGH-SIGNAL EXTRACTION ONLY: Prioritize concrete engineering actions (API/DB/auth/pipeline design, bug fixes, performance/concurrency/testing work, deployment/CI/CD, key PRs/issues). Strip out meaningless noise like "fix typo", "update readme", or empty labels unless tied to a concrete technical change.
-3. EVIDENCE TRACEABILITY: Whenever possible, reference actual commit headlines, PR/issue titles, or line/repetition counts from the input data inside the descriptions so claims are verifiable.
-4. SECTION & COLUMN CONSISTENCY: Every section must define a unified `ai_columns` array, and every detail card in that section must populate `column_values` matching those exact column names without omitting columns.
-5. OUTPUT FORMAT: Respond ONLY with a valid JSON object matching the requested schema. No markdown fences outside JSON, no commentary."""
+CRITICAL GOALS:
+1. Analyze the aggregated GitHub repository data and organize them into the requested template sections (`template_sections`).
+2. **Each Section must define its own unified `ai_columns` array at the section level** matching the provided template columns.
+3. **DO NOT OMIT OR OVERSIMPLIFY DETAILS.** For each project or card, write rich, comprehensive resume descriptions covering architecture, technical challenges solved, specific features implemented, and concrete outcomes based *strictly* on the provided commit/PR/issue data. Avoid vague one-line summaries or raw log dumps.
+4. All detail cards within that section **must share the exact same `ai_columns`**, acting like a uniform table where each card holds corresponding `column_values`.
+5. Never invent or hallucinate missing details; stick strictly to provided facts.
+6. Write clear, polished developer resume descriptions rather than copying raw commit headlines verbatim.
+7. DETERMINE CARD COUNT BY REPOSITORY / DISTINCT PROJECT: Evaluate the aggregated repository data holistically and create ONE cohesive card per repository unless the data clearly contains multiple distinct standalone sub-projects. Do NOT split a single repository into multiple cards by chunk order.
+8. CLEAN BULLET FORMATTING: Format multi-point fields (`핵심 구현 및 커밋 성과`, `트러블슈팅 및 개선` 등) as clean newline-separated bullet lines (`- ...`) rather than long run-on sentences."""
 
 GITHUB_TEMPLATE_PRESETS: dict[str, dict[str, Any]] = {
     "CUSTOM_SINGLE": {
@@ -73,7 +75,6 @@ GITHUB_TEMPLATE_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
-# 원천 데이터(JSON)를 제외한 순수 기본 프롬프트 지시문 템플릿
 BASE_PROMPT_TEMPLATE = """You are an objective software engineering activity analyst.
 Analyze the provided GitHub activity records strictly grounded in source facts without hallucination.
 Preserve key metrics, technical stacks, commits, PRs, issues, and troubleshooting outcomes.
@@ -82,7 +83,7 @@ Merge duplicate findings across chunks cleanly and organize the final output str
 SUB_BASE_PROMPT_TEMPLATE = """You are a strict technical data compression engine for developer activity analysis.
 STRICT RULES:
 1. ZERO FABRICATION: Every fact, commit message, PR/issue title, line count, repetition count, or tech stack MUST come strictly from the input chunk.
-2. DO NOT MERGE DIFFERENT REPOSITORIES: Keep the chunk's `repo_name` and `target_author` intact.
+2. DO NOT CREATE RESUME SECTIONS OR CARDS: Only compress raw activity evidence into the flat JSON schema.
 3. PRESERVE HIGH-SIGNAL EVIDENCE: Retain concrete technical actions, tech stacks (`tech_stacks`), key commits (`key_commits`), and PRs/issues (`key_prs_and_issues`).
 4. DROP TRIVIAL NOISE: Remove meaningless commits/PRs/issues (e.g., typo, formatting) unless tied to concrete technical changes."""
 
@@ -93,6 +94,22 @@ TRACE_FILE = CACHE_DIR / "experiment_trace.json"
 EXPERIMENT_DIR = Path(__file__).resolve().parent.parent / "experiments"
 EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARY_CSV_PATH = EXPERIMENT_DIR / "runs_summary.csv"
+
+
+def _format_card_value_html(val: Any) -> str:
+    if isinstance(val, list):
+        lines = [str(x).strip() for x in val if str(x).strip()]
+    else:
+        raw = str(val or "").strip()
+        normalized = raw.replace(" · ", "\n• ")
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if not lines:
+        return "-"
+    formatted_lines = []
+    for line in lines:
+        clean_line = line.lstrip("-• ").strip()
+        formatted_lines.append(f"• {clean_line}")
+    return "<br>".join(formatted_lines)
 
 
 def _flatten_generated_sections_to_df(generated_sections: list[dict[str, Any]]) -> pd.DataFrame:
@@ -119,7 +136,7 @@ def _flatten_generated_sections_to_df(generated_sections: list[dict[str, Any]]) 
             col_vals = item.get("column_values") or {}
             if isinstance(col_vals, dict):
                 for k, v in col_vals.items():
-                    row[str(k)] = ", ".join(map(str, v)) if isinstance(v, list) else str(v)
+                    row[str(k)] = "\n".join(map(str, v)) if isinstance(v, list) else str(v)
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -156,96 +173,13 @@ def _flatten_sub_outputs_to_df(sub_prompts: list[dict[str, Any]]) -> pd.DataFram
 
 
 def _save_run_to_csvs(
-    pipe: dict[str, Any],
-    chunk_limit_mode: str,
-    run_label: str = "",
-) -> str:
-    """실행 결과를 CSV 4종(요약, 청크상세, 항목추적, 최종생성표)으로 저장"""
-    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_sum = pipe.get("sub_run_summary") or {}
-    u = pipe.get("token_usage") or {}
-    comp = pipe.get("comparison") or {}
-    sub_prompts = pipe.get("sub_prompts") or []
-    cleaned_data = pipe.get("cleaned_data") or []
-
-    repos = [p.get("repo_name", "-") for p in cleaned_data if isinstance(p, dict)]
-    repo_str = ", ".join(repos) if repos else "-"
-
-    # 1) 누적 실행 요약 CSV (runs_summary.csv)
-    summary_row = {
-        "run_id": run_id,
-        "실험라벨": run_label.strip() or f"실험_{run_id}",
-        "실행시각": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "대상저장소": repo_str,
-        "분할기준": chunk_limit_mode,
-        "청크수": len(sub_prompts),
-        "배분방식": "비례 배분" if run_sum.get("allocation_mode") == "proportional" else "공통 배분",
-        "서브템플릿반영": "ON" if run_sum.get("apply_template_in_sub", True) else "OFF",
-        "서브한도합계": run_sum.get("total_sub_pool", 0),
-        "압축전토큰": run_sum.get("raw_sub_tokens", 0),
-        "압축후토큰": run_sum.get("compressed_sub_tokens", 0),
-        "토큰압축률(%)": run_sum.get("token_compression_pct", 0.0),
-        "원본항목수": run_sum.get("total_raw_items", 0),
-        "서브보존항목수": run_sum.get("retained_items", 0),
-        "서브보존율(%)": run_sum.get("sub_item_retention_pct", 0.0),
-        "종합근거반영률(%)": comp.get("direct_evidence_mention_pct", 0.0),
-        "실측입력토큰": u.get("prompt_tokens", 0),
-        "실측출력토큰": u.get("completion_tokens", 0),
-        "실측총API토큰": u.get("total_tokens", 0),
-    }
-    sum_df_new = pd.DataFrame([summary_row])
-    if SUMMARY_CSV_PATH.exists():
-        sum_df_prev = pd.read_csv(SUMMARY_CSV_PATH, dtype={"run_id": str})
-        sum_df_all = pd.concat([sum_df_prev, sum_df_new], ignore_index=True)
-    else:
-        sum_df_all = sum_df_new
-    sum_df_all.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8-sig")
-
-    # 2) 청크별 상세 표 CSV (chunks_{run_id}.csv)
-    chunks_df = _flatten_sub_outputs_to_df(sub_prompts)
-    chunks_df.insert(0, "run_id", run_id)
-    chunks_df.to_csv(EXPERIMENT_DIR / f"chunks_{run_id}.csv", index=False, encoding="utf-8-sig")
-
-    # 3) 항목별 보존/유실 추적 CSV (items_{run_id}.csv)
-    item_rows = []
-    final_blob = json.dumps(pipe.get("generated_sections") or [], ensure_ascii=False)
-    for idx, sp in enumerate(sub_prompts):
-        c_idx = sp.get("chunk_index", idx + 1)
-        r_name = sp.get("repo_name", "-")
-        raw_ch = sp.get("raw_chunk_data") or {}
-        sub_out_blob = json.dumps(sp.get("sub_llm_output") or {}, ensure_ascii=False)
-        for item_type, key_name in [("Commit", "key_commits"), ("PR/Issue", "key_prs_and_issues")]:
-            for raw_line in raw_ch.get(key_name, []) or []:
-                core = raw_line.lstrip("- ").split(" (반복")[0].split(" (상태:")[0].strip()
-                item_rows.append({
-                    "run_id": run_id,
-                    "청크번호": c_idx,
-                    "저장소": r_name,
-                    "유형": item_type,
-                    "원문항목": raw_line,
-                    "핵심문자열(core)": core,
-                    "서브보존여부": "O" if (core and core in sub_out_blob) else "X",
-                    "종합반영여부": "O" if (core and core in final_blob) else "X",
-                })
-    pd.DataFrame(item_rows).to_csv(EXPERIMENT_DIR / f"items_{run_id}.csv", index=False, encoding="utf-8-sig")
-
-    # 4) 최종 생성 결과 표 CSV (generated_{run_id}.csv)
-    gen_df = _flatten_generated_sections_to_df(pipe.get("generated_sections") or [])
-    if not gen_df.empty:
-        gen_df.insert(0, "run_id", run_id)
-    gen_df.to_csv(EXPERIMENT_DIR / f"generated_{run_id}.csv", index=False, encoding="utf-8-sig")
-
-    return run_id
-
-
-def _save_run_to_csvs(
     pipe: dict,
-    analysis_data: dict,
     chunk_limit_mode: str,
     run_label: str = "",
 ) -> str:
-    """3-3 실행 결과를 runs_summary.csv(누적) + chunks_{run_id}.csv + items_{run_id}.csv 로 저장"""
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    """3-3 실행 결과를 runs_summary.csv(누적) + chunks_{run_id}.csv + items_{run_id}.csv + generated_{run_id}.csv 로 저장"""
+    now_dt = datetime.datetime.now()
+    run_id = now_dt.strftime("%Y%m%d_%H%M%S")
     run_sum = pipe.get("sub_run_summary") or {}
     u = pipe.get("token_usage") or {}
     comp = pipe.get("comparison") or {}
@@ -255,11 +189,10 @@ def _save_run_to_csvs(
     repos = [p.get("repo_name", "-") for p in cleaned_data if isinstance(p, dict)]
     repo_str = ", ".join(repos) if repos else "-"
 
-    # 1) 누적 실행 요약 CSV (runs_summary.csv)
     summary_row = {
         "run_id": run_id,
         "실험라벨": run_label.strip() or f"실험_{run_id}",
-        "실행시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "실행시각": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
         "대상저장소": repo_str,
         "분할기준": chunk_limit_mode,
         "청크수": len(sub_prompts),
@@ -285,7 +218,6 @@ def _save_run_to_csvs(
         sum_df_all = sum_df_new
     sum_df_all.to_csv(SUMMARY_CSV_PATH, index=False, encoding="utf-8-sig")
 
-    # 2) 청크별 상세 CSV (chunks_{run_id}.csv)
     chunk_rows = []
     item_rows = []
     final_blob = json.dumps(pipe.get("generated_sections") or [], ensure_ascii=False)
@@ -309,7 +241,6 @@ def _save_run_to_csvs(
             "항목보존율(%)": ret.get("retention_rate_pct", 0.0),
         })
 
-        # 3) 항목별 보존/유실 로그 CSV (items_{run_id}.csv)
         for item_type, key_name in [("Commit", "key_commits"), ("PR/Issue", "key_prs_and_issues")]:
             for raw_line in raw_ch.get(key_name, []) or []:
                 core = raw_line.lstrip("- ").split(" (반복")[0].split(" (상태:")[0].strip()
@@ -326,9 +257,14 @@ def _save_run_to_csvs(
                     "종합반영여부": final_kept,
                 })
 
+    gen_df = _flatten_generated_sections_to_df(pipe.get("generated_sections") or [])
+    if not gen_df.empty:
+        gen_df.insert(0, "run_id", run_id)
     pd.DataFrame(chunk_rows).to_csv(EXPERIMENT_DIR / f"chunks_{run_id}.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(item_rows).to_csv(EXPERIMENT_DIR / f"items_{run_id}.csv", index=False, encoding="utf-8-sig")
+    gen_df.to_csv(EXPERIMENT_DIR / f"generated_{run_id}.csv", index=False, encoding="utf-8-sig")
     return run_id
+
 
 def _load_trace() -> dict[str, Any]:
     if not TRACE_FILE.exists():
@@ -350,14 +286,8 @@ def _clear_streamlit_caches() -> None:
     st.cache_data.clear()
     st.cache_resource.clear()
 
+
 def _clear_trace(scope: str) -> None:
-    """
-    scope:
-      - "step3": 3단계(파이프라인 결과/단계/모드 비교 이력)만 초기화 (4단계 CSV는 유지)
-      - "step4": 4단계(저장된 experiments/*.csv 파일)만 초기화
-      - "stage2": 2·3단계(검색 저장소, 분석 데이터, 파이프라인 결과) 초기화 (4단계 CSV는 유지)
-      - "all": 1·2·3·4단계 흔적, 세션, 저장된 실험 CSV 전체 초기화
-    """
     _clear_streamlit_caches()
     trace = _load_trace()
 
@@ -430,7 +360,6 @@ def _count_ui_tokens(text: str) -> int:
 
 
 def _calc_pure_prompt_tokens(template_config: dict[str, Any] | None = None) -> int:
-    """원본 데이터를 제외한 순수 기본 프롬프트(지시문 + 출력 스키마 구조)의 토큰 수만 계산"""
     schema_part = ""
     if template_config:
         schema_part = json.dumps(template_config, ensure_ascii=False)
@@ -456,6 +385,32 @@ st.markdown(
         padding: 8px 18px;
         font-weight: 600;
     }
+    .resume-card {
+        border: 1px solid rgba(128, 128, 128, 0.28);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin-bottom: 16px;
+        background-color: rgba(255, 255, 255, 0.02);
+    }
+    .resume-card-title {
+        font-size: 1.08rem;
+        font-weight: 700;
+        margin-bottom: 12px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+    }
+    .resume-field-label {
+        font-weight: 600;
+        margin-top: 10px;
+        margin-bottom: 4px;
+        font-size: 0.95rem;
+    }
+    .resume-field-body {
+        line-height: 1.6;
+        font-size: 0.92rem;
+        padding-left: 8px;
+        margin-bottom: 6px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -477,7 +432,7 @@ if "_trace_restored" not in st.session_state:
 st.title("GitHub 사용자 활동 탐색 & 청크 기반 데이터 가치 검증")
 
 # =========================================================
-# 상단 캐시 초기화 영역 (2단계·3단계 탭 위 배치)
+# 상단 캐시 초기화 영역
 # =========================================================
 top_cache_info, top_btn1, top_btn2, top_btn3, top_btn4 = st.columns([2.6, 1, 1, 1, 1])
 with top_cache_info:
@@ -563,25 +518,34 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**사용 흔적 및 초기화**")
-    st.caption(f"흔적 파일: `{TRACE_FILE.name}` ({'저장됨' if TRACE_FILE.exists() else '없음'})")
+    csv_count_sb = len(list(EXPERIMENT_DIR.glob("*.csv"))) if EXPERIMENT_DIR.exists() else 0
+    st.caption(
+        f"흔적 파일: `{TRACE_FILE.name}` ({'저장됨' if TRACE_FILE.exists() else '없음'}) · "
+        f"CSV: `{csv_count_sb}개`"
+    )
 
     rst_c1, rst_c2 = st.columns(2)
-    if rst_c1.button("3단계만 초기화", width="stretch", key="btn_reset_step3"):
+    if rst_c1.button("3단계 초기화", width="stretch", key="btn_reset_step3"):
         _clear_trace("step3")
         st.rerun()
-    if rst_c2.button("2단계 초기화", width="stretch", key="btn_reset_stage2"):
-        _clear_trace("stage2")
+    if rst_c2.button("4단계 CSV 초기화", width="stretch", key="btn_reset_step4"):
+        _clear_trace("step4")
         st.rerun()
 
-    if st.button("전체 흔적 초기화 (1~3단계)", width="stretch", key="btn_reset_all"):
+    rst_c3, rst_c4 = st.columns(2)
+    if rst_c3.button("2·3단계 초기화", width="stretch", key="btn_reset_stage2"):
+        _clear_trace("stage2")
+        st.rerun()
+    if rst_c4.button("전체 초기화 (1~4단계)", width="stretch", key="btn_reset_all"):
         _clear_trace("all")
         st.rerun()
 
+
 # =========================================================
-# 2단계 & 3단계 탭 분리
+# 2단계 & 3단계 & 4단계 탭 분리
 # =========================================================
 tab_stage2, tab_stage3, tab_stage4 = st.tabs(
-[
+    [
         "2단계 · 저장소 선택 및 사용자 활동 분석",
         "3단계 · 청크 분할 가치 평가 및 생성 테스트",
         "4단계 · 해석 및 분석 (CSV 표 검증)",
@@ -589,7 +553,7 @@ tab_stage2, tab_stage3, tab_stage4 = st.tabs(
 )
 
 # =========================================================
-# TAB 1 (2단계): 저장소 선택(다중 가능), 탐색 항목 선택 및 활동 분석
+# TAB 1 (2단계)
 # =========================================================
 with tab_stage2:
     st.subheader("2. 저장소 선택(다중 가능), 탐색 항목·템플릿 설정 및 사용자 활동 분석")
@@ -610,25 +574,6 @@ with tab_stage2:
             key="ms_selected_repos",
         )
         selected_repos = [repo_options[lbl] for lbl in picked_labels]
-
-    manual_repos_text = st.text_area(
-        "추가/직접 입력 저장소 (owner/repo, 줄바꿈 또는 쉼표로 여러 개 가능)",
-        placeholder="예:\nkimdfarm/News_quiz_by_slack\nkimdfarm/dmu_Graduation_project",
-        height=75,
-        key="ta_manual_repos",
-    )
-    if manual_repos_text.strip():
-        raw_tokens = [
-            item.strip()
-            for line in manual_repos_text.splitlines()
-            for item in line.split(",")
-            if item.strip()
-        ]
-        existing_names = {r["full_name"] for r in selected_repos}
-        for full in raw_tokens:
-            if full not in existing_names:
-                selected_repos.append({"full_name": full, "name": full.split("/")[-1]})
-                existing_names.add(full)
 
     for _k, _default_val in [
         ("chk_commits", True),
@@ -668,7 +613,6 @@ with tab_stage2:
     }
     selected_explore_types = [k for k, checked in chk_state_map.items() if checked]
 
-    # ② 템플릿 및 추출 데이터 컬럼 커스텀 설정
     st.markdown("**② 추출 데이터 컬럼 & 템플릿 커스텀 설정**")
     tpl_keys = list(GITHUB_TEMPLATE_PRESETS.keys())
     selected_tpl_key = st.selectbox(
@@ -792,6 +736,7 @@ with tab_stage2:
             for err_msg in errors:
                 st.error(f"분석 실패 — {err_msg}")
 
+
 def _compute_ui_sub_budgets(
     chunk_tokens_list: list[int],
     max_total_tokens: int,
@@ -799,13 +744,6 @@ def _compute_ui_sub_budgets(
     allocation_mode: str,
     total_sub_cap_input: int,
 ) -> tuple[list[int], int]:
-    """
-    total_sub_cap_input == 0 이면 가용 종합 예산((max_total_tokens - base_prompt_tokens) * 0.9)을
-    전체 청크 압축 합산 최대 토큰(total_pool)으로 자동 설정.
-    0보다 크면 사용자가 입력한 값을 전체 청크 압축 합산 최대 토큰(total_pool)으로 사용.
-    - proportional: total_pool * (chunk_tok / sum_tok)
-    - equal: total_pool // N
-    """
     n = max(1, len(chunk_tokens_list))
     auto_pool = max(200, int((max_total_tokens - base_prompt_tokens) * 0.9))
     total_pool = int(total_sub_cap_input) if total_sub_cap_input > 0 else auto_pool
@@ -818,10 +756,10 @@ def _compute_ui_sub_budgets(
     budgets = [max(50, int(round(total_pool * (tok / sum_tok)))) for tok in chunk_tokens_list]
     return budgets, total_pool
 
+
 # =========================================================
-# TAB 2 (3단계): 청크 분할 가치 평가 및 백엔드 생성 기능 테스트
+# TAB 2 (3단계)
 # =========================================================
-# 2) tab_stage3 전체 교체
 with tab_stage3:
     analysis_data = st.session_state.get("analysis_data")
     target_author_val = st.session_state.get("ti_target_author", github_id)
@@ -831,9 +769,6 @@ with tab_stage3:
     else:
         st.header("3. 청크 분할 가치 평가 및 백엔드 생성 기능 테스트")
 
-        # =====================================================
-        # [3-1] 토큰 예산 및 청크 분할 한도 설정
-        # =====================================================
         st.subheader("3-1. 토큰 예산 및 청크 분할 한도 설정")
 
         raw_proj_list = analysis_data.get("projects_data") or [analysis_data]
@@ -977,7 +912,7 @@ with tab_stage3:
                 st.error(f"백엔드 서버({backend_url})에 연결할 수 없습니다. FastAPI 서버가 실행 중인지 확인해 주세요.")
 
         pipe = st.session_state.get("pipeline_res")
-        
+
         if pipe:
             sub_prompts = pipe.get("sub_prompts", [])
             limits = pipe.get("chunk_limits", {})
@@ -987,7 +922,7 @@ with tab_stage3:
             )
 
             # =====================================================
-            # [3-2] AI 미사용: 생 데이터 정보 -> 전처리 되는 정보 -> 청크 분해된 정보
+            # [3-2] AI 미사용: 생 데이터 -> 전처리 -> 청크 분해
             # =====================================================
             st.divider()
             st.subheader("3-2. 생 데이터 정보 · 전처리 되는 정보 · 청크 분해된 정보 (AI 미사용)")
@@ -1006,7 +941,6 @@ with tab_stage3:
             m4.metric("실제 분할 청크 수", f"{limits.get('actual_chunk_count', len(sub_prompts))}개")
             m5.metric("생성된 서브 프롬프트 수", f"{total_sub_prompts}개")
 
-            # ① 생 데이터 정보
             st.markdown("### ① 생 데이터 정보 (`analysis_data`)")
             raw_info_rows = []
             for p in raw_src_projects:
@@ -1031,7 +965,6 @@ with tab_stage3:
             with st.expander("생 데이터 원본 JSON 보기"):
                 st.json(analysis_data)
 
-            # ② 전처리 되는 정보
             st.markdown("### ② 전처리 되는 정보 (`cleaned_data`)")
             st.caption(
                 f"작성자 필터(`{target_author_val or github_id or 'ALL'}`), 동일 커밋 메시지 병합, "
@@ -1045,31 +978,12 @@ with tab_stage3:
             with st.expander("전처리된 데이터 JSON 보기"):
                 st.json(cleaned_all)
 
-            # ③ 청크 분해된 정보
             st.markdown("### ③ 청크 분해된 정보 (`chunks` / `sub_prompts`)")
-            fixed_sub_cmd_str = json.dumps(
-                {
-                    "role": "strict_sub_llm_compressor",
-                    "template_sections": analysis_data.get("template_config"),
-                    "rules": [
-                        "ZERO FABRICATION",
-                        "PRESERVE EVIDENCE",
-                        "DROP TRIVIAL NOISE",
-                    ],
-                },
-                ensure_ascii=False,
-            )
-            fixed_sub_cmd_tokens = _count_ui_tokens(fixed_sub_cmd_str)
-
             simplified_eval_rows = []
             for idx, sp in enumerate(sub_prompts):
                 row_src = eval_rows[idx] if idx < len(eval_rows) and isinstance(eval_rows[idx], dict) else {}
                 raw_chunk_tok = int(sp.get("tokens", row_src.get("청크_데이터_토큰수", 0)) or 0)
-
-                # 모든 청크에 동일한 고정 기본 명령어 토큰을 반영한 서브 LLM 토큰 수
-                sub_llm_tok = int(
-                    sp.get("fixed_sub_cmd_tokens")
-                )
+                sub_llm_tok = int(sp.get("fixed_sub_cmd_tokens", 0) or 0)
 
                 simplified_eval_rows.append({
                     "청크번호": sp.get("chunk_index", row_src.get("청크번호", idx + 1)),
@@ -1094,8 +1008,9 @@ with tab_stage3:
                     r_name = sp.get("repo_name", "-")
                     st.markdown(f"**청크 #{c_idx} — {r_name}** (`{sp.get('tokens', 0)} tokens`)")
                     st.json(sp.get("raw_chunk_data"))
-# =====================================================
-            # [3-3] AI 실행 영역 (서브/종합 Base 프롬프트 · 2단계 템플릿 연동 · 배분 설정 · 실시간 압축)
+
+            # =====================================================
+            # [3-3] AI 실행 영역
             # =====================================================
             st.divider()
             st.subheader("3-3. 서브/종합 LLM 커스텀 · 템플릿 반영 설정 및 실시간 압축 실행")
@@ -1113,7 +1028,6 @@ with tab_stage3:
             linked_sec = (linked_tpl.get("sections") or [{}])[0]
             linked_cols = linked_sec.get("columns") or []
 
-            # ① 2단계 템플릿 연동 및 서브 LLM 반영 여부 선택
             with st.container(border=True):
                 st.markdown("**① 2단계 템플릿 연동 & 서브 LLM 반영 여부**")
                 t_col1, t_col2 = st.columns([2, 1])
@@ -1128,19 +1042,17 @@ with tab_stage3:
                         "서브 LLM에 템플릿 반영",
                         value=True,
                         help=(
-                            "ON: 서브 LLM 단계부터 템플릿 컬럼에 맞춰 추출·압축합니다.\n"
-                            "OFF: 서브 LLM은 템플릿 없이 순수 기술 사실만 보존 압축하고, 최종 종합 LLM에서만 템플릿을 적용합니다."
+                            "ON: 서브 LLM 단계에서 템플릿 컬럼명(target_columns)에 맞춰 근거를 압축합니다. (카드/섹션 미생성)\n"
+                            "OFF: 서브 LLM은 템플릿 없이 순수 기술 사실만 압축하고, 최종 종합 LLM에서만 템플릿 섹션과 카드를 생성합니다."
                         ),
                         key="ui_apply_tpl_in_sub",
                     )
                     st.caption(
-                        "현재 모드: **템플릿 반영 압축 (ON)**"
+                        "현재 모드: **컬럼 기준 압축 (ON)**"
                         if apply_template_in_sub
                         else "현재 모드: **순수 사실 보존 압축 (OFF)**"
                     )
 
-            # ② 서브 LLM & 종합 LLM 기본 Base 프롬프트 커스텀 설정
-# ② 서브 LLM & 종합 LLM 명령 프롬프트(수정 가능) / 구조 프롬프트(고정 · 기본 토큰 표시)
             if "saved_sub_base_prompt" not in st.session_state:
                 st.session_state["saved_sub_base_prompt"] = SUB_BASE_PROMPT_TEMPLATE
             if "saved_final_base_prompt" not in st.session_state:
@@ -1148,17 +1060,17 @@ with tab_stage3:
             if "prompt_saved_at" not in st.session_state:
                 st.session_state["prompt_saved_at"] = "초기 기본값"
 
-            # 백엔드에서 파싱을 위해 붙는 고정 '구조 프롬프트' 스키마 문자열 계산
+            # 서브 LLM에는 카드/섹션이 아닌 순수 컬럼명 목록과 플랫 스키마만 표시
             sub_struct_with_tpl = json.dumps(
                 {
-                    "template_sections": linked_tpl.get("sections") or [],
+                    "target_columns": linked_cols,
                     "schema_on": {
                         "repo_name": "",
                         "target_author": "",
                         "tech_stacks": [],
                         "key_commits": [],
                         "key_prs_and_issues": [],
-                        "column_evidence": {},
+                        "column_evidence": {c: [] for c in linked_cols},
                     },
                 },
                 ensure_ascii=False,
@@ -1220,7 +1132,7 @@ with tab_stage3:
                 p_col1, p_col2 = st.columns(2)
 
                 with p_col1:
-                    st.markdown("#### 서브 LLM 프롬프트")
+                    st.markdown("#### 서브 LLM 프롬프트 (컬럼 기준 데이터 압축 전용)")
                     draft_sub_prompt = st.text_area(
                         "서브 명령 프롬프트 (수정 가능)",
                         value=st.session_state["saved_sub_base_prompt"],
@@ -1230,21 +1142,21 @@ with tab_stage3:
                     draft_sub_cmd_tok = _count_ui_tokens(draft_sub_prompt)
                     sub_has_unsaved = draft_sub_prompt.strip() != st.session_state["saved_sub_base_prompt"].strip()
 
-                    st.markdown("**🔒 서브 구조 프롬프트 (변경 불가 · 기본 고정)**")
+                    st.markdown("**🔒 서브 구조 프롬프트 (변경 불가 · 카드/섹션 미포함)**")
                     st.code(active_sub_struct_str, language="json")
 
                     st.markdown(
                         f"- **명령 프롬프트 토큰(저장 기준)**: `{sub_cmd_saved_tokens:,} tokens` "
                         f"(입력창 `{draft_sub_cmd_tok:,} tokens`)\n"
                         f"- **구조 프롬프트 토큰(고정 기본값)**: `{sub_struct_tokens:,} tokens` "
-                        f"({'템플릿 반영 ON 스키마' if apply_template_in_sub else '템플릿 OFF 스키마'})\n"
+                        f"({'컬럼 반영 ON 스키마' if apply_template_in_sub else '템플릿 OFF 스키마'})\n"
                         f"- **서브 프롬프트 합계 토큰**: **`{sub_total_fixed_tokens:,} tokens`**\n"
                         f"- **상태**: `{'⚠️ 미저장 변경 있음' if sub_has_unsaved else '✅ 저장 완료'}` · "
                         f"`{'커스텀' if sub_is_custom else '기본값'}`"
                     )
 
                 with p_col2:
-                    st.markdown("#### 종합 LLM 프롬프트")
+                    st.markdown("#### 종합 LLM 프롬프트 (저장소별 통합 & 카드 생성)")
                     draft_final_prompt = st.text_area(
                         "종합 명령 프롬프트 (수정 가능)",
                         value=st.session_state["saved_final_base_prompt"],
@@ -1254,7 +1166,7 @@ with tab_stage3:
                     draft_final_cmd_tok = _count_ui_tokens(draft_final_prompt)
                     final_has_unsaved = draft_final_prompt.strip() != st.session_state["saved_final_base_prompt"].strip()
 
-                    st.markdown("**🔒 종합 구조 프롬프트 (변경 불가 · 기본 고정)**")
+                    st.markdown("**🔒 종합 구조 프롬프트 (변경 불가 · 섹션/카드 스키마)**")
                     st.code(final_struct_str, language="json")
 
                     st.markdown(
@@ -1290,31 +1202,27 @@ with tab_stage3:
 
                 b_col1, b_col2, b_col3 = st.columns([2, 1, 1])
                 if b_col1.button("💾 커스텀 명령 프롬프트 저장 (실행에 반영)", type="primary", width="stretch", key="btn_save_custom_prompts"):
-                    from datetime import datetime
                     st.session_state["saved_sub_base_prompt"] = draft_sub_prompt
                     st.session_state["saved_final_base_prompt"] = draft_final_prompt
-                    st.session_state["prompt_saved_at"] = datetime.now().strftime("%H:%M:%S")
+                    st.session_state["prompt_saved_at"] = datetime.datetime.now().strftime("%H:%M:%S")
                     st.success(f"명령 프롬프트가 저장되었습니다. ({st.session_state['prompt_saved_at']})")
                     st.rerun()
 
                 if b_col2.button("서브 명령 기본값 복원", width="stretch", key="btn_reset_sub_prompt"):
-                    from datetime import datetime
                     st.session_state["saved_sub_base_prompt"] = SUB_BASE_PROMPT_TEMPLATE
                     st.session_state["ui_draft_sub_base_prompt"] = SUB_BASE_PROMPT_TEMPLATE
-                    st.session_state["prompt_saved_at"] = datetime.now().strftime("%H:%M:%S")
+                    st.session_state["prompt_saved_at"] = datetime.datetime.now().strftime("%H:%M:%S")
                     st.rerun()
 
                 if b_col3.button("종합 명령 기본값 복원", width="stretch", key="btn_reset_final_prompt"):
-                    from datetime import datetime
                     st.session_state["saved_final_base_prompt"] = FINAL_BASE_PROMPT_TEMPLATE
                     st.session_state["ui_draft_final_base_prompt"] = FINAL_BASE_PROMPT_TEMPLATE
-                    st.session_state["prompt_saved_at"] = datetime.now().strftime("%H:%M:%S")
+                    st.session_state["prompt_saved_at"] = datetime.datetime.now().strftime("%H:%M:%S")
                     st.rerun()
 
             custom_sub_base_prompt = st.session_state["saved_sub_base_prompt"]
             custom_final_base_prompt = st.session_state["saved_final_base_prompt"]
 
-            # ③ 서브 LLM 전체 출력 한도 및 배분 방식 (비례 vs 공통 N등분) — 그래프 없이 표로만 표시
             with st.container(border=True):
                 st.markdown("**③ 서브 LLM 전체 출력 한도 및 청크별 배분 설정**")
                 cfg_col1, cfg_col2 = st.columns(2)
@@ -1471,9 +1379,9 @@ with tab_stage3:
 
                         progress_bar.progress(
                             total_chunks / max(1, total_chunks + 1),
-                            text="서브 LLM 압축 완료! 종합 LLM 구조화 생성 실행 중...",
+                            text="서브 LLM 압축 완료! 저장소별 통합 후 종합 LLM 카드 생성 실행 중...",
                         )
-                        status_box.write("⏳ 압축된 청크들을 종합 프롬프트로 통합해 최종 구조화 생성 중...")
+                        status_box.write("⏳ 압축된 청크들을 저장소 단위로 모아 종합 프롬프트로 최종 카드 생성 중...")
 
                         syn_resp = requests.post(
                             f"{backend_url}/api/github/synthesize-chunks",
@@ -1612,10 +1520,10 @@ with tab_stage3:
                             st.caption("압축 전 (청크 생 데이터)")
                             st.json(sp.get("raw_chunk_data"))
                         with col_a:
-                            st.caption("압축 후 (서브 LLM 출력 -> 종합 프롬프트 입력)")
+                            st.caption("압축 후 (서브 LLM 출력 -> 저장소별 통합 입력)")
                             st.json(sp.get("sub_llm_output"))
 
-                with st.expander("종합 입력 프롬프트 전문 보기 (서브 LLM 압축 결과 반영)"):
+                with st.expander("종합 입력 프롬프트 전문 보기 (저장소별 통합 반영)"):
                     st.code(pipe.get("combined_prompt", ""), language="text")
 
                 st.divider()
@@ -1626,7 +1534,6 @@ with tab_stage3:
                 c_m2.metric("원문 직접 매칭 항목 수", f"{comp.get('directly_matched_items', 0)}개")
                 c_m3.metric("직접 근거 언급률", f"{comp.get('direct_evidence_mention_pct', 0)}%")
 
-                # 1) 서브 LLM 압축 결과 표 + CSV 다운로드
                 st.markdown("#### ① 서브 LLM 청크별 압축 결과 표")
                 sub_table_df = _flatten_sub_outputs_to_df(sub_prompts)
                 if not sub_table_df.empty:
@@ -1639,11 +1546,41 @@ with tab_stage3:
                         key="dl_sub_table_3_4",
                     )
 
-                # 2) 종합 LLM 구조화 생성 결과 표 + CSV 다운로드
-                st.markdown("#### ② 종합 LLM 최종 해석 결과 표 (JSON → Table 변환)")
-                gen_table_df = _flatten_generated_sections_to_df(pipe.get("generated_sections") or [])
+                st.markdown("#### ② 종합 LLM 최종 해석 결과 (이력서 카드 뷰 & 전체 표)")
+                gen_sections = pipe.get("generated_sections") or []
+                gen_table_df = _flatten_generated_sections_to_df(gen_sections)
+
+                if gen_sections:
+                    for sec in gen_sections:
+                        if not isinstance(sec, dict):
+                            continue
+                        sec_title = sec.get("section_title") or sec.get("title") or "섹션"
+                        st.markdown(f"##### 📌 {sec_title}")
+                        for item in sec.get("details") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            card_title = item.get("title", "항목")
+                            col_vals = item.get("column_values") or {}
+                            fields_html = ""
+                            if isinstance(col_vals, dict):
+                                for k, v in col_vals.items():
+                                    val_html = _format_card_value_html(v)
+                                    fields_html += (
+                                        f'<div class="resume-field-label">▪ {k}</div>'
+                                        f'<div class="resume-field-body">{val_html}</div>'
+                                    )
+                            st.markdown(
+                                f'<div class="resume-card">'
+                                f'<div class="resume-card-title">{card_title}</div>'
+                                f'{fields_html}'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
                 if not gen_table_df.empty:
-                    st.dataframe(gen_table_df, width="stretch")
+                    with st.expander("전체 결과 표 형태로 펼쳐보기 (줄바꿈 적용)", expanded=False):
+                        st.table(gen_table_df)
+
                     st.download_button(
                         "⬇️ 최종 생성 결과 표 CSV 다운로드",
                         data=gen_table_df.to_csv(index=False).encode("utf-8-sig"),
@@ -1654,20 +1591,6 @@ with tab_stage3:
                 else:
                     st.info("표로 변환할 생성 결과가 없습니다.")
 
-                with st.expander("원본 JSON & 해석 JSON 원문 비교 보기"):
-                    col_orig, col_interp = st.columns(2)
-                    with col_orig:
-                        st.markdown("**원본 정제 데이터 (`cleaned_data`)**")
-                        st.json(pipe.get("cleaned_data", []))
-                    with col_interp:
-                        st.markdown("**해석 및 구조화 데이터 (`generated_sections`)**")
-                        st.json(pipe.get("generated_sections", []))
-
-                if comp.get("unmatched_sample"):
-                    with st.expander("해석 결과 문자열에 직접 포함되지 않은 원본 항목 샘플"):
-                        st.write(comp["unmatched_sample"])
-
-                # 3) 4단계 분석 탭용 CSV 4종 세트 일괄 저장
                 with st.container(border=True):
                     st.markdown("**③ 실험 결과 CSV 세트 저장 (4단계 '해석 및 분석' 탭 연동)**")
                     sv_c1, sv_c2 = st.columns([2, 1])
@@ -1797,8 +1720,3 @@ with tab_stage4:
                 mime="text/csv",
                 key="dl_s4_items",
             )
-
-
-
-
-

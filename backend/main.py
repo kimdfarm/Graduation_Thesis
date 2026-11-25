@@ -16,6 +16,7 @@ import httpx
 from pydantic import BaseModel
 import requests
 import tiktoken
+
 # tiktoken 토크나이저 초기화 (o200k_base 기반, 실패 시 문자 길이 폴백)
 try:
     TOKENIZER = tiktoken.get_encoding("o200k_base")
@@ -30,6 +31,7 @@ def count_tokens(obj: Any) -> int:
     if TOKENIZER is not None:
         return len(TOKENIZER.encode(text))
     return max(1, len(text) // 2)
+
 
 load_dotenv()
 
@@ -47,9 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 메모리/파일 기반 임시 결과 저장소 (Supabase 대체)
 GENERATED_DOCS: Dict[str, Any] = {}
-
 
 ALL_EXPLORE_TYPES = ["commits", "prs", "issues", "languages", "repo_meta"]
 
@@ -59,7 +59,7 @@ class RepoAnalyzeRequest(BaseModel):
     repo_name: str
     start_date: Optional[str] = None
     end_date: Optional[str] = None
-    include_types: Optional[List[str]] = None  # 예: ["commits"], ["commits", "prs"] 등
+    include_types: Optional[List[str]] = None
 
 
 def build_selective_graphql_query(include_types: List[str]) -> str:
@@ -159,6 +159,8 @@ query GetSelectiveRepoAnalytics($owner: String!, $name: String!, $afterCursor: S
   }}
 }}
 """
+
+
 class ResumeGenerateRequest(BaseModel):
     title: str
     category: str = "BACKEND_AI"
@@ -434,9 +436,7 @@ def split_repo_by_properties(repo_data: dict, max_tokens: int = 1200) -> list:
         }
         has_existing_items = bool(current_chunk["key_commits"] or current_chunk["key_prs_and_issues"])
         if count_tokens(candidate) > max_tokens and has_existing_items:
-            # 초과 직전 데이터까지만 하나의 청크로 확정
             chunks.append(current_chunk)
-            # 초과를 유발한 현재 항목부터 새 청크 시작
             current_chunk = {
                 "repo_name": f"{repo_data.get('repo_name')} (part {len(chunks) + 1})",
                 "target_author": repo_data.get("target_author"),
@@ -533,6 +533,7 @@ def normalize_github_resume_data(parsed_dict: dict) -> dict:
 
     return {"doc_type": parsed_dict.get("doc_type", "RESUME"), "sections": normalized_sections}
 
+
 def extract_usage_metrics(completion_obj: Any) -> Dict[str, int]:
     usage = getattr(completion_obj, "usage", None)
     if not usage:
@@ -551,6 +552,61 @@ def add_usage(target: Dict[str, int], delta: Dict[str, int]) -> None:
     target["prompt_tokens"] += delta.get("prompt_tokens", 0)
     target["completion_tokens"] += delta.get("completion_tokens", 0)
     target["total_tokens"] += delta.get("total_tokens", 0)
+
+
+def _extract_base_repo_name(name: str) -> str:
+    cleaned = re.sub(r"\s*\((?:part|chunk|continuing)\s*\d*(?:\s*/\s*\d+)?\)\s*$", "", str(name or ""), flags=re.IGNORECASE)
+    return cleaned.strip() or "프로젝트"
+
+
+def _merge_compressed_chunks_by_repo(compressed_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """청크별 서브 LLM 압축 결과를 원본 저장소 단위로 병합하여 종합 LLM에 전달"""
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for ch in compressed_chunks or []:
+        if not isinstance(ch, dict):
+            continue
+        base_repo = _extract_base_repo_name(ch.get("repo_name") or "")
+        if base_repo not in grouped:
+            grouped[base_repo] = {
+                "repo_name": base_repo,
+                "target_author": ch.get("target_author") or "",
+                "tech_stacks": [],
+                "key_commits": [],
+                "key_prs_and_issues": [],
+                "column_evidence": {},
+            }
+        target = grouped[base_repo]
+        if not target["target_author"] and ch.get("target_author"):
+            target["target_author"] = ch.get("target_author")
+
+        for tech in ch.get("tech_stacks") or []:
+            if tech and tech not in target["tech_stacks"]:
+                target["tech_stacks"].append(tech)
+
+        for c in ch.get("key_commits") or []:
+            if c and c not in target["key_commits"]:
+                target["key_commits"].append(c)
+
+        for p in ch.get("key_prs_and_issues") or []:
+            if p and p not in target["key_prs_and_issues"]:
+                target["key_prs_and_issues"].append(p)
+
+        col_ev = ch.get("column_evidence")
+        if isinstance(col_ev, dict):
+            for col_name, ev_list in col_ev.items():
+                existing = target["column_evidence"].setdefault(col_name, [])
+                items = ev_list if isinstance(ev_list, list) else [ev_list]
+                for item in items:
+                    if item and item not in existing:
+                        existing.append(item)
+
+    merged_list = []
+    for entry in grouped.values():
+        if not entry["column_evidence"]:
+            entry.pop("column_evidence", None)
+        merged_list.append(entry)
+    return merged_list
+
 
 def ai_intelligent_preprocess(
     projects_data: list,
@@ -593,17 +649,18 @@ def ai_intelligent_preprocess(
     ]
 
     if not groq_client:
-        meta["processed_tokens"] = sum(count_tokens(c) for c in all_chunks)
-        return all_chunks, meta, compression_usage
+        merged_fallback = _merge_compressed_chunks_by_repo(all_chunks)
+        meta["processed_tokens"] = sum(count_tokens(c) for c in merged_fallback)
+        return merged_fallback, meta, compression_usage
 
     chunk_sizes = [count_tokens(c) for c in all_chunks]
     total_chunk_tokens = sum(chunk_sizes) or 1
-    template_str = json.dumps(template_sections, ensure_ascii=False)
-    compressed_projects = []
+    target_columns = [col for sec in (template_sections or []) for col in (sec.get("columns") or [])]
+    compressed_chunks = []
 
     system_prompt = f"""You are a strict technical data compression engine for developer resume generation.
-Align the given GitHub activity chunk with the target template sections:
-{template_str}
+Extract evidence aligned with these target columns ONLY (do NOT create resume sections or cards):
+{json.dumps(target_columns, ensure_ascii=False)}
 
 Rules:
 1. ZERO FABRICATION: Do not invent facts, metrics, or tools absent from the chunk.
@@ -627,12 +684,13 @@ Rules:
             )
             add_usage(compression_usage, extract_usage_metrics(completion))
             parsed = safe_json_parse(completion.choices[0].message.content or "")
-            compressed_projects.append(parsed)
+            compressed_chunks.append(parsed)
         except Exception:
-            compressed_projects.append(chunk)
+            compressed_chunks.append(chunk)
 
-    meta["processed_tokens"] = sum(count_tokens(p) for p in compressed_projects)
-    return compressed_projects, meta, compression_usage
+    merged_projects = _merge_compressed_chunks_by_repo(compressed_chunks)
+    meta["processed_tokens"] = sum(count_tokens(p) for p in merged_projects)
+    return merged_projects, meta, compression_usage
 
 
 @app.get("/api/develop/github/repositories")
@@ -708,6 +766,7 @@ def get_github_repositories(
 
     return {"repositories": list(unique_repos.values())}
 
+
 GITHUB_ENV_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
 
@@ -725,6 +784,7 @@ def get_config_status():
         "has_env_github_token": bool(GITHUB_ENV_TOKEN),
         "has_groq_api_key": bool(GROQ_API_KEY),
     }
+
 
 @app.post("/api/github/analyze")
 async def analyze_repository_graphql(payload: RepoAnalyzeRequest, authorization: Optional[str] = Header(None)):
@@ -794,6 +854,7 @@ async def analyze_repository_graphql(payload: RepoAnalyzeRequest, authorization:
     base_repo_data["target_author"] = payload.github_id
     base_repo_data["include_types"] = selected_types
     return base_repo_data
+
 
 STRICT_ANALYSIS_SYSTEM_PROMPT = """You are a strict technical evidence extractor and developer resume structuring engine.
 Your job is to transform GitHub repository activity (commits, PRs, issues, languages) into structured JSON for engineering evaluation.
@@ -889,6 +950,7 @@ CHUNKS: {json.dumps(chunks, ensure_ascii=False)[:4500]}
         "chunks": chunks,
         "llm_judge": judge_result,
     }
+
 
 @app.post("/api/resumes/github-generate")
 async def generate_github_resume(payload: ResumeGenerateRequest):
@@ -993,7 +1055,6 @@ async def generate_github_resume(payload: ResumeGenerateRequest):
     return result_obj
 
 
-# 2) ChunkPreviewRequest 및 헬퍼 교체 (max_chunks 제거)
 class ChunkPreviewRequest(BaseModel):
     analysis_data: Dict[str, Any]
     target_author: Optional[str] = None
@@ -1016,7 +1077,7 @@ class ChunkPreviewRequest(BaseModel):
 DEFAULT_SUB_BASE_PROMPT = """You are a strict technical data compression engine for developer activity analysis.
 STRICT RULES:
 1. ZERO FABRICATION: Every fact, commit message, PR/issue title, line count, repetition count, or tech stack MUST come strictly from the input chunk.
-2. DO NOT MERGE DIFFERENT REPOSITORIES: Keep the chunk's `repo_name` and `target_author` intact.
+2. DO NOT CREATE RESUME SECTIONS OR CARDS: Only compress raw activity evidence into the flat JSON schema.
 3. PRESERVE HIGH-SIGNAL EVIDENCE: Retain concrete technical actions, tech stacks (`tech_stacks`), key commits (`key_commits`), and PRs/issues (`key_prs_and_issues`).
 4. DROP TRIVIAL NOISE: Remove meaningless commits/PRs/issues (e.g., typo, formatting) unless tied to concrete technical changes."""
 
@@ -1051,15 +1112,17 @@ def _calc_chunk_item_retention(raw_chunk: dict, compressed_chunk: dict) -> Dict[
     }
 
 
-DEFAULT_FINAL_BASE_PROMPT = """You are a strict technical evidence extractor and developer resume structuring engine.
-Your job is to transform GitHub repository activity (commits, PRs, issues, languages) into structured JSON for engineering evaluation.
+DEFAULT_FINAL_BASE_PROMPT = """You are an expert developer resume formatting and structuring engine.
 
-STRICT ANTI-HALLUCINATION & RIGOR RULES:
-1. ZERO FABRICATION: Every technical claim, architecture decision, library/framework name, metric, or outcome MUST be directly grounded in the provided input data. If a detail is not present in the input, DO NOT invent or guess it.
-2. HIGH-SIGNAL EXTRACTION ONLY: Prioritize concrete engineering actions (API/DB/auth/pipeline design, bug fixes, performance/concurrency/testing work, deployment/CI/CD, key PRs/issues). Strip out meaningless noise like "fix typo", "update readme", or empty labels unless tied to a concrete technical change.
-3. EVIDENCE TRACEABILITY: Whenever possible, reference actual commit headlines, PR/issue titles, or line/repetition counts from the input data inside the descriptions so claims are verifiable.
-4. SECTION & COLUMN CONSISTENCY: Every section must define a unified `ai_columns` array, and every detail card in that section must populate `column_values` matching those exact column names without omitting columns.
-5. OUTPUT FORMAT: Respond ONLY with a valid JSON object matching the requested schema. No markdown fences outside JSON, no commentary."""
+CRITICAL GOALS:
+1. Analyze the aggregated GitHub repository data and organize them into the requested template sections (`template_sections`).
+2. **Each Section must define its own unified `ai_columns` array at the section level** matching the provided template columns.
+3. **DO NOT OMIT OR OVERSIMPLIFY DETAILS.** For each project or card, write rich, comprehensive resume descriptions covering architecture, technical challenges solved, specific features implemented, and concrete outcomes based *strictly* on the provided commit/PR/issue data. Avoid vague one-line summaries or raw log dumps.
+4. All detail cards within that section **must share the exact same `ai_columns`**, acting like a uniform table where each card holds corresponding `column_values`.
+5. Never invent or hallucinate missing details; stick strictly to provided facts.
+6. Write clear, polished developer resume descriptions rather than copying raw commit headlines verbatim.
+7. DETERMINE CARD COUNT BY REPOSITORY / DISTINCT PROJECT: Evaluate the aggregated repository data holistically and create ONE cohesive card per repository unless the data clearly contains multiple distinct standalone sub-projects. Do NOT split a single repository into multiple cards by chunk order.
+8. CLEAN BULLET FORMATTING: Format multi-point fields (`핵심 구현 및 커밋 성과`, `트러블슈팅 및 개선` 등) as clean newline-separated bullet lines (`- ...`) rather than long run-on sentences."""
 
 
 class SynthesizeChunksRequest(BaseModel):
@@ -1068,6 +1131,7 @@ class SynthesizeChunksRequest(BaseModel):
     template_sections: List[Dict[str, Any]]
     language: str = "ko"
     custom_final_base_prompt: Optional[str] = None
+
 
 def compute_sub_llm_budgets(
     chunk_tokens_list: List[int],
@@ -1085,7 +1149,6 @@ def compute_sub_llm_budgets(
     if not sub_llm_auto and custom_sub_tokens and custom_sub_tokens > 0:
         if allocation_mode == "equal":
             return [int(custom_sub_tokens)] * n
-        # 비례 배분 + 커스텀 입력 시: custom_sub_tokens * n 을 총 풀로 보고 청크 비중대로 배분
         total_pool = max(200, int(custom_sub_tokens) * n)
 
     if allocation_mode == "equal":
@@ -1127,12 +1190,14 @@ def compress_single_chunk_endpoint(req: SingleChunkCompressRequest):
         "compressed_chunk": compressed_obj,
     }
 
+
 @app.post("/api/github/synthesize-chunks")
 def synthesize_compressed_chunks_endpoint(req: SynthesizeChunksRequest):
-    """[3-3 최종 종합 단계] 모든 서브 LLM 압축 결과를 종합 프롬프트로 구조화 생성"""
+    """[3-3 최종 종합 단계] 모든 서브 LLM 압축 결과를 저장소 단위로 모은 뒤 종합 프롬프트로 카드 생성"""
+    aggregated_by_repo = _merge_compressed_chunks_by_repo(req.compressed_chunks)
     sys_prompt, final_user_prompt = build_final_prompt(
         req.template_sections,
-        req.compressed_chunks,
+        aggregated_by_repo,
         language=req.language,
         custom_base_prompt=req.custom_final_base_prompt,
     )
@@ -1195,6 +1260,7 @@ def synthesize_compressed_chunks_endpoint(req: SynthesizeChunksRequest):
         },
     }
 
+
 def _resolve_sub_llm_budget(req: ChunkPreviewRequest, chunk_count: int, final_sys_prompt: str) -> int:
     final_overhead = count_tokens(final_sys_prompt) + 300
     available = max(200, int(req.max_total_tokens) - final_overhead)
@@ -1202,6 +1268,7 @@ def _resolve_sub_llm_budget(req: ChunkPreviewRequest, chunk_count: int, final_sy
     if not req.sub_llm_auto and req.sub_llm_max_tokens and req.sub_llm_max_tokens > 0:
         return int(req.sub_llm_max_tokens)
     return auto_budget
+
 
 def split_repo_into_max_chunks(repo_data: dict, max_chunks: int) -> list:
     """저장소의 커밋/PR/이슈 항목을 최대 max_chunks 개수로 나누어 분할"""
@@ -1353,12 +1420,10 @@ def _build_chunk_preview_data(req: ChunkPreviewRequest) -> Dict[str, Any]:
                 "초과사유": ", ".join(reasons) if reasons else "-",
             }
 
-        sub_prompt_text = build_sub_prompt(ch, template_sections, sub_llm_budget)
-        sub_prompt_tokens = count_tokens(sub_prompt_text)
         fixed_sub_instruction = (
             "[Fixed Sub-LLM Instruction]\n"
-            "Compress ONLY the given GitHub chunk into JSON aligned with target template sections. "
-            "Zero fabrication, preserve concrete commits/PRs/issues/tech_stacks, drop trivial noise."
+            "Compress ONLY the given GitHub chunk into flat JSON aligned with target columns. "
+            "Do NOT create resume sections or cards. Zero fabrication, preserve concrete evidence."
         )
         fixed_sub_cmd_tokens = count_tokens(fixed_sub_instruction)
         sub_prompt_text = build_sub_prompt(ch, template_sections, sub_llm_budget)
@@ -1378,7 +1443,8 @@ def _build_chunk_preview_data(req: ChunkPreviewRequest) -> Dict[str, Any]:
             "raw_chunk_data": ch,
         })
 
-    sys_prompt, final_user_prompt = build_final_prompt(template_sections, chunks, language=req.language)
+    merged_preview = _merge_compressed_chunks_by_repo(chunks)
+    sys_prompt, final_user_prompt = build_final_prompt(template_sections, merged_preview, language=req.language)
     combined_raw_prompt = f"[SYSTEM PROMPT]\n{sys_prompt}\n\n[USER PROMPT]\n{final_user_prompt}"
 
     return {
@@ -1407,121 +1473,11 @@ def _build_chunk_preview_data(req: ChunkPreviewRequest) -> Dict[str, Any]:
 
 @app.post("/api/github/pipeline-inspect")
 def run_pipeline_inspect(req: ChunkPreviewRequest):
-    analysis_inc = (req.analysis_data or {}).get("include_types")
-    raw_projects = (req.analysis_data or {}).get("projects_data") or [req.analysis_data]
-    cleaned_projects = [
-        preprocess_github_data(
-            repo,
-            target_author=req.target_author or repo.get("target_author", ""),
-            start_date=req.start_date,
-            end_date=req.end_date,
-            include_types=repo.get("include_types") or analysis_inc,
-        )
-        for repo in raw_projects
-        if isinstance(repo, dict)
-    ]
-
-    raw_rows: List[Dict[str, Any]] = []
-    for proj in cleaned_projects:
-        r_name = proj.get("repo_name", "")
-        author = proj.get("target_author", "")
-        techs = ", ".join(proj.get("tech_stacks", []))
-        for c in proj.get("key_commits", []):
-            raw_rows.append({
-                "저장소": r_name,
-                "작성자": author,
-                "유형": "Commit",
-                "기술스택": techs,
-                "내용": c,
-                "토큰수": count_tokens(c),
-            })
-        for item in proj.get("key_prs_and_issues", []):
-            kind = "PR" if "[PR]" in item else "Issue"
-            raw_rows.append({
-                "저장소": r_name,
-                "작성자": author,
-                "유형": kind,
-                "기술스택": techs,
-                "내용": item,
-                "토큰수": count_tokens(item),
-            })
-
-    mode = req.chunk_limit_mode
-    token_limit = max(200, int(req.chunk_token_limit or 1200))
-    chunk_cap = max(1, int(req.max_chunks or 6))
-
-    chunks: List[dict] = []
-    if mode == "max_chunks":
-        per_repo_cap = max(1, chunk_cap // max(1, len(cleaned_projects)))
-        for proj in cleaned_projects:
-            chunks.extend(split_repo_into_max_chunks(proj, max_chunks=per_repo_cap))
-        if len(chunks) > chunk_cap:
-            chunks = chunks[:chunk_cap]
-        exceeded_chunk_count_limit = len(chunks) > chunk_cap
-    else:
-        for proj in cleaned_projects:
-            if req.force_chunking or count_tokens(proj) > token_limit:
-                chunks.extend(split_repo_by_properties(proj, max_tokens=token_limit))
-            else:
-                chunks.append(proj)
-        exceeded_chunk_count_limit = False
-
-    template_sections = _resolve_template_sections(req)
-
-    sys_prompt_preview, _ = build_final_prompt(template_sections, [], language=req.language)
-    sub_llm_budget = _resolve_sub_llm_budget(req, len(chunks), sys_prompt_preview)
-
-    chunk_evaluations: List[Dict[str, Any]] = []
-    sub_prompts: List[Dict[str, Any]] = []
-
-    for idx, ch in enumerate(chunks):
-        c_tokens = count_tokens(ch)
-        c_commits = len(ch.get("key_commits", []))
-        c_prs_issues = len(ch.get("key_prs_and_issues", []))
-        c_items = c_commits + c_prs_issues
-
-        reasons = []
-        if mode == "max_chunks":
-            is_exceeded = (idx + 1) > chunk_cap
-            if is_exceeded:
-                reasons.append(f"제한 청크 수 초과({idx + 1}번째 > {chunk_cap}개)")
-            eval_row = {
-                "청크번호": idx + 1,
-                "저장소/구분": ch.get("repo_name"),
-                "커밋수": c_commits,
-                "PR/이슈수": c_prs_issues,
-                "총항목수": c_items,
-                "토큰수": c_tokens,
-                "적용기준": f"최대 {chunk_cap}개",
-                "한도초과여부": "초과" if is_exceeded else "정상",
-                "초과사유": ", ".join(reasons) if reasons else "-",
-            }
-        else:
-            is_exceeded = c_tokens > token_limit
-            if is_exceeded:
-                reasons.append(f"토큰 초과({c_tokens} > {token_limit})")
-            eval_row = {
-                "청크번호": idx + 1,
-                "저장소/구분": ch.get("repo_name"),
-                "커밋수": c_commits,
-                "PR/이슈수": c_prs_issues,
-                "총항목수": c_items,
-                "토큰수": c_tokens,
-                "토큰한도": token_limit,
-                "한도초과여부": "초과" if is_exceeded else "정상",
-                "초과사유": ", ".join(reasons) if reasons else "-",
-            }
-
-        sub_prompt_text = build_sub_prompt(ch, template_sections, sub_llm_budget)
-        chunk_evaluations.append(eval_row)
-        sub_prompts.append({
-            "chunk_index": idx + 1,
-            "repo_name": ch.get("repo_name"),
-            "tokens": c_tokens,
-            "exceeded": is_exceeded,
-            "sub_prompt": sub_prompt_text,
-            "raw_chunk_data": ch,
-        })
+    preview = _build_chunk_preview_data(req)
+    template_sections = preview.pop("template_sections")
+    sub_prompts = preview["sub_prompts"]
+    cleaned_projects = preview["cleaned_data"]
+    sub_llm_budget = preview["chunk_limits"]["sub_llm_budget"]
 
     generated_sections: List[Dict[str, Any]] = []
     usage_summary: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1545,10 +1501,11 @@ def run_pipeline_inspect(req: ChunkPreviewRequest):
             sp["sub_llm_output"] = None
             compressed_chunks_for_final.append(raw_ch)
 
+    aggregated_by_repo = _merge_compressed_chunks_by_repo(compressed_chunks_for_final)
     sys_prompt, final_user_prompt = build_final_prompt(
-        template_sections, compressed_chunks_for_final, language=req.language
+        template_sections, aggregated_by_repo, language=req.language
     )
-    combined_raw_prompt = f"[SYSTEM PROMPT]\n{sys_prompt}\n\n[USER PROMPT]\n{final_user_prompt}"
+    preview["combined_prompt"] = f"[SYSTEM PROMPT]\n{sys_prompt}\n\n[USER PROMPT]\n{final_user_prompt}"
 
     if req.run_generation and groq_client:
         for attempt in range(3):
@@ -1591,24 +1548,7 @@ def run_pipeline_inspect(req: ChunkPreviewRequest):
     mention_rate = round((len(matched_items) / len(all_raw_items)) * 100, 2) if all_raw_items else 100.0
 
     return {
-        "tokenizer": "tiktoken (o200k_base)",
-        "applied_template": {
-            "section_count": len(template_sections),
-            "sections": template_sections,
-        },
-        "cleaned_data": cleaned_projects,
-        "raw_table_rows": raw_rows,
-        "combined_prompt": combined_raw_prompt,
-        "chunk_limits": {
-            "max_total_tokens": req.max_total_tokens,
-            "chunk_limit_mode": mode,
-            "max_chunks": chunk_cap if mode == "max_chunks" else None,
-            "chunk_token_limit": token_limit if mode == "chunk_tokens" else None,
-            "actual_chunk_count": len(chunks),
-            "exceeded_chunk_count_limit": exceeded_chunk_count_limit,
-        },
-        "chunk_evaluations": chunk_evaluations,
-        "sub_prompts": sub_prompts,
+        **preview,
         "generated_sections": generated_sections,
         "token_usage": usage_summary,
         "model_used": model_used,
@@ -1628,8 +1568,6 @@ def run_chunk_preview(req: ChunkPreviewRequest):
     data = _build_chunk_preview_data(req)
     data.pop("template_sections", None)
     return data
-
-
 
 
 def _resolve_template_sections(req: ChunkPreviewRequest) -> List[Dict[str, Any]]:
@@ -1674,10 +1612,10 @@ def build_sub_prompt(chunk: dict, template_sections: list, budget_tokens: int) -
     target_cols = [col for sec in template_sections for col in (sec.get("columns") or [])]
     return (
         f"[Sub-Prompt | Token Budget: {budget_tokens}]\n"
-        f"Target Template Sections: {json.dumps(template_sections, ensure_ascii=False)}\n"
-        f"Extract & map evidence specifically for columns: {json.dumps(target_cols, ensure_ascii=False)}\n"
+        f"Extract & map evidence specifically for columns (DO NOT create cards/sections): {json.dumps(target_cols, ensure_ascii=False)}\n"
         f"Chunk Payload:\n{json.dumps(chunk, ensure_ascii=False, indent=2)}"
     )
+
 
 def build_final_prompt(
     template_sections: list,
@@ -1685,14 +1623,24 @@ def build_final_prompt(
     language: str = "ko",
     custom_base_prompt: Optional[str] = None,
 ) -> tuple[str, str]:
-    lang_rule = "모든 설명은 자연스럽고 정확한 한국어로 작성하세요." if language == "ko" else "Write all descriptions in English."
+    if language == "ko":
+        lang_instruction = (
+            "CRITICAL LANGUAGE RULE: You MUST write ALL descriptions, project summaries, "
+            "achievements, and text values in natural, professional **Korean (한국어)** suitable for a developer resume. "
+            "Even if the original GitHub commit messages, PR titles, or repository descriptions are in English, "
+            "translate and re-synthesize them into polished Korean resume sentences. "
+            "Technical stack names (e.g., Python, TypeScript, React, FastAPI) and proper nouns can remain as they are."
+        )
+    else:
+        lang_instruction = "Please write everything in professional **English** suitable for a developer resume."
+
     primary_sec = template_sections[0] if template_sections else {}
     example_cols = primary_sec.get("columns") or ["역할 및 구현", "기술 스택 및 근거"]
-    example_col_values = {col: f"{col} 관점의 근거 기반 상세 내용" for col in example_cols}
+    example_col_values = {col: f"- {col} 관점의 구체적이고 상세한 이력서 설명" for col in example_cols}
     base_instruction = (custom_base_prompt or DEFAULT_FINAL_BASE_PROMPT).strip()
 
     sys_prompt = f"""{base_instruction}
-{lang_rule}
+{lang_instruction}
 지정된 템플릿 섹션(`section_title`)과 컬럼(`columns` -> `ai_columns`, `column_values`) 구조에 맞춰 결과를 구성하세요.
 반드시 아래 JSON 스키마로만 응답하세요:
 {{
@@ -1706,7 +1654,7 @@ def build_final_prompt(
       "details": [
         {{
           "id": "card_1",
-          "title": "항목 제목",
+          "title": "저장소/프로젝트 대표 제목",
           "column_values": {json.dumps(example_col_values, ensure_ascii=False)}
         }}
       ]
@@ -1715,19 +1663,65 @@ def build_final_prompt(
 }}"""
     usr_prompt = (
         f"[템플릿 구조]\n{json.dumps(template_sections, ensure_ascii=False, indent=2)}\n\n"
-        f"[청크 처리/종합 입력 데이터]\n{json.dumps(processed_data, ensure_ascii=False, indent=2)}"
+        f"[저장소별 통합 입력 데이터]\n{json.dumps(processed_data, ensure_ascii=False, indent=2)}"
     )
     return sys_prompt, usr_prompt
 
 
+def _build_sub_skeleton(chunk: dict, template_sections: list, apply_template_in_sub: bool) -> Dict[str, Any]:
+    """서브 LLM 출력의 고정 JSON 기본 틀(스키마 뼈대 — 카드/섹션 구조 미포함)"""
+    base: Dict[str, Any] = {
+        "repo_name": str(chunk.get("repo_name") or ""),
+        "target_author": str(chunk.get("target_author") or ""),
+        "tech_stacks": [],
+        "key_commits": [],
+        "key_prs_and_issues": [],
+    }
+    if apply_template_in_sub:
+        base["column_evidence"] = {
+            col: []
+            for sec in (template_sections or [])
+            for col in (sec.get("columns") or [])
+        }
+    return base
 
-def _resolve_sub_llm_budget(req: ChunkPreviewRequest, chunk_count: int, final_sys_prompt: str) -> int:
-    final_overhead = count_tokens(final_sys_prompt) + 300
-    available = max(200, int(req.max_total_tokens) - final_overhead)
-    auto_budget = max(100, int((available * 0.9) // max(1, chunk_count)))
-    if not req.sub_llm_auto and req.sub_llm_max_tokens and req.sub_llm_max_tokens > 0:
-        return int(req.sub_llm_max_tokens)
-    return auto_budget
+
+def _shrink_chunk_to_budget(
+    chunk: dict,
+    template_sections: list,
+    apply_template_in_sub: bool,
+    content_budget_tokens: int,
+) -> Dict[str, Any]:
+    """기본 틀을 제외한 순수 내용 예산(content_budget_tokens)에 맞춰 항목을 축소"""
+    skeleton = _build_sub_skeleton(chunk, template_sections, apply_template_in_sub)
+    skeleton_tokens = count_tokens(skeleton)
+    target_total_tokens = max(skeleton_tokens + 20, skeleton_tokens + max(20, content_budget_tokens))
+
+    out = json.loads(json.dumps(skeleton, ensure_ascii=False))
+    for tech in (chunk.get("tech_stacks") or [])[:5]:
+        cand = {**out, "tech_stacks": out["tech_stacks"] + [tech]}
+        if count_tokens(cand) <= target_total_tokens:
+            out["tech_stacks"].append(tech)
+
+    commits = list(chunk.get("key_commits") or [])
+    prs_issues = list(chunk.get("key_prs_and_issues") or [])
+    for idx in range(max(len(commits), len(prs_issues))):
+        progressed = False
+        if idx < len(commits):
+            cand = {**out, "key_commits": out["key_commits"] + [commits[idx]]}
+            if count_tokens(cand) <= target_total_tokens:
+                out["key_commits"].append(commits[idx])
+                progressed = True
+        if idx < len(prs_issues):
+            cand = {**out, "key_prs_and_issues": out["key_prs_and_issues"] + [prs_issues[idx]]}
+            if count_tokens(cand) <= target_total_tokens:
+                out["key_prs_and_issues"].append(prs_issues[idx])
+                progressed = True
+        if not progressed and count_tokens(out) >= target_total_tokens:
+            break
+
+    return out
+
 
 def compress_chunk_with_sub_llm_strict(
     chunk: dict,
@@ -1737,42 +1731,46 @@ def compress_chunk_with_sub_llm_strict(
     apply_template_in_sub: bool = True,
     custom_sub_base_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
+    skeleton = _build_sub_skeleton(chunk, template_sections, apply_template_in_sub)
+    skeleton_tokens = count_tokens(skeleton)
+    content_budget = max(30, int(sub_budget_tokens) - skeleton_tokens)
+    effective_max_tokens = max(128, skeleton_tokens + content_budget)
+
     if not groq_client:
-        return chunk
+        return _shrink_chunk_to_budget(chunk, template_sections, apply_template_in_sub, content_budget)
 
     base_instruction = (custom_sub_base_prompt or DEFAULT_SUB_BASE_PROMPT).strip()
     chunk_json = json.dumps(chunk, ensure_ascii=False)
+    budget_rule = (
+        f"\n[OUTPUT BUDGET RULE — EXCLUDING FIXED JSON SKELETON]\n"
+        f"- Fixed JSON skeleton uses ~{skeleton_tokens} tokens.\n"
+        f"- Keep your extracted content (commits, PRs/issues, tech_stacks, column_evidence) strictly within ~{content_budget} tokens "
+        f"(total JSON around ~{effective_max_tokens} tokens).\n"
+        f"- Drop lower-priority or noisy items first so the response stays concise and within budget."
+    )
 
-    if apply_template_in_sub and template_sections:
-        template_info_str = json.dumps(template_sections, ensure_ascii=False)
-        sub_system_prompt = f"""{base_instruction}
+    target_columns = [
+        col
+        for sec in (template_sections or [])
+        for col in (sec.get("columns") or [])
+    ]
 
-[Target Template Structure & Columns — ALIGN EXTRACTION TO THESE]
-{template_info_str}
+    if apply_template_in_sub and target_columns:
+        sub_system_prompt = f"""{base_instruction}{budget_rule}
+
+[Target Columns — EXTRACT EVIDENCE FOR THESE COLUMNS ONLY (DO NOT CREATE RESUME SECTIONS OR CARDS)]
+{json.dumps(target_columns, ensure_ascii=False)}
 
 5. STRICT JSON SCHEMA: Respond ONLY with valid JSON using this exact top-level structure:
-{{
-  "repo_name": "{chunk.get('repo_name', '')}",
-  "target_author": "{chunk.get('target_author', '')}",
-  "tech_stacks": [],
-  "key_commits": [],
-  "key_prs_and_issues": [],
-  "column_evidence": {{}}
-}}"""
+{json.dumps(skeleton, ensure_ascii=False, indent=2)}"""
     else:
-        sub_system_prompt = f"""{base_instruction}
+        sub_system_prompt = f"""{base_instruction}{budget_rule}
 
 [Mode: Template-Agnostic Pure Fact Compression]
-Do NOT filter or drop technical items for template alignment; preserve maximum factual coverage of commits, PRs/issues, and tech stacks within the token budget.
+Do NOT filter or drop technical items for template alignment; pack maximum factual coverage of commits, PRs/issues, and tech stacks within the content budget.
 
 5. STRICT JSON SCHEMA: Respond ONLY with valid JSON using this exact top-level structure:
-{{
-  "repo_name": "{chunk.get('repo_name', '')}",
-  "target_author": "{chunk.get('target_author', '')}",
-  "tech_stacks": [],
-  "key_commits": [],
-  "key_prs_and_issues": []
-}}"""
+{json.dumps(skeleton, ensure_ascii=False, indent=2)}"""
 
     for attempt in range(3):
         model_name = PRIMARY_MODEL_NAME if attempt == 0 else FALLBACK_MODEL_NAME
@@ -1784,7 +1782,7 @@ Do NOT filter or drop technical items for template alignment; preserve maximum f
                     {"role": "user", "content": chunk_json},
                 ],
                 temperature=0.1,
-                max_completion_tokens=sub_budget_tokens,
+                max_completion_tokens=effective_max_tokens,
                 response_format={"type": "json_object"},
             )
             add_usage(usage_summary, extract_usage_metrics(chat_completion))
@@ -1797,20 +1795,18 @@ Do NOT filter or drop technical items for template alignment; preserve maximum f
                 res_obj: Dict[str, Any] = {
                     "repo_name": str(parsed.get("repo_name") or chunk.get("repo_name") or ""),
                     "target_author": str(parsed.get("target_author") or chunk.get("target_author") or ""),
-                    "tech_stacks": parsed.get("tech_stacks") if isinstance(parsed.get("tech_stacks"), list) else chunk.get("tech_stacks", []),
-                    "key_commits": parsed.get("key_commits") if isinstance(parsed.get("key_commits"), list) else chunk.get("key_commits", []),
-                    "key_prs_and_issues": parsed.get("key_prs_and_issues") if isinstance(parsed.get("key_prs_and_issues"), list) else chunk.get("key_prs_and_issues", []),
+                    "tech_stacks": parsed.get("tech_stacks") if isinstance(parsed.get("tech_stacks"), list) else [],
+                    "key_commits": parsed.get("key_commits") if isinstance(parsed.get("key_commits"), list) else [],
+                    "key_prs_and_issues": parsed.get("key_prs_and_issues") if isinstance(parsed.get("key_prs_and_issues"), list) else [],
                 }
                 if apply_template_in_sub:
                     res_obj["column_evidence"] = parsed.get("column_evidence") if isinstance(parsed.get("column_evidence"), dict) else {}
+
+                if count_tokens(res_obj) > effective_max_tokens:
+                    res_obj = _shrink_chunk_to_budget(res_obj, template_sections, apply_template_in_sub, content_budget)
                 return res_obj
         except Exception:
             if attempt < 2:
                 py_time.sleep((2 ** attempt) + random.uniform(0.3, 0.8))
 
-    return chunk
-
-
-
-
-
+    return _shrink_chunk_to_budget(chunk, template_sections, apply_template_in_sub, content_budget)
