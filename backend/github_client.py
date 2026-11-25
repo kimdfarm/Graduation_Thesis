@@ -7,7 +7,7 @@ from fastapi import HTTPException
 import httpx
 import requests
 
-from chunker import ALL_EXPLORE_TYPES, parse_iso_dt
+from backend.chunker import ALL_EXPLORE_TYPES, parse_iso_dt
 
 GITHUB_ENV_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
