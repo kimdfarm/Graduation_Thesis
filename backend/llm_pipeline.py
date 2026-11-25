@@ -9,14 +9,14 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from groq import Groq
 
-from backend.chunker import (
+from chunker import (
     count_tokens,
     merge_compressed_chunks_by_repo,
     preprocess_github_data,
     split_repo_by_properties,
     split_repo_into_max_chunks,
 )
-from backend.schemas import ChunkPreviewRequest
+from schemas import ChunkPreviewRequest
 
 load_dotenv()
 
