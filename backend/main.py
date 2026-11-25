@@ -6,18 +6,18 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from chunker import (
+from backend.chunker import (
     count_tokens,
     merge_compressed_chunks_by_repo,
     preprocess_github_data,
     split_repo_by_properties,
 )
-from github_client import (
+from backend.github_client import (
     GITHUB_ENV_TOKEN,
     fetch_filtered_repositories,
     fetch_repository_analytics,
 )
-from llm_pipeline import (
+from backend.llm_pipeline import (
     FALLBACK_MODEL_NAME,
     PRIMARY_MODEL_NAME,
     STRICT_ANALYSIS_SYSTEM_PROMPT,
@@ -35,7 +35,7 @@ from llm_pipeline import (
     resolve_template_sections,
     safe_json_parse,
 )
-from schemas import (
+from backend.schemas import (
     ChunkEvaluateRequest,
     ChunkPreviewRequest,
     RepoAnalyzeRequest,
