@@ -1,0 +1,21 @@
+﻿run_id,프로젝트폴더,섹션유형,섹션제목,카드ID,항목제목,프로젝트 개요 및 역할,사용 기술 및 라이브러리,핵심 구현 및 커밋 성과,트러블슈팅 및 개선
+20261125_212946,청크당_최대_2000토큰_공통형,CUSTOM,GitHub 활동 분석 및 추출 컬럼,card_1,dmu_Graduation_project,"- GitHub 데이터 분석 및 이력서 자동 생성 웹 애플리케이션 개발
+- 프론트엔드(React)와 백엔드(Python/FastAPI) 통합
+- AI 기반 문서 교정 및 요약 기능 구현
+- 사용자 인증, 이메일 인증, 회원 관리 기능 추가","- JavaScript, TypeScript, Python, CSS, HTML
+- React, Node.js, FastAPI, Supabase, Gemini, Groq, LSI, OCR, kiwipiepy, torch, lsi, lsi
+- GitHub API, OAuth, JWT, CORS, HTTPS, SSL, Vercel, Docker","- GitHub 분석 로직을 청크 단위로 분해해 토큰 한계 극복
+- AI 교정 프롬프트 최적화(temperature 조정, 프롬포트 개선)
+- 프론트엔드 사용자 인터페이스 완성(모바일, 프로필, 로그인, 회원가입)
+- Supabase를 두 개의 데이터베이스(채용사이트, 회원 서비스)로 분리
+- OCR 인식 모듈 추가 및 AI 모델 연구(구글, Groq)
+- 이메일 인증(Resend, SSL 포트 465) 및 CORS 설정 개선
+- 프론트엔드와 백엔드 간 API 통신 안정화(HTTPS, JWT)
+- GitHub 분석 결과를 한글/영어 구분 강화 및 토큰 계산 로직 개선","- 청크 분해 시 버그(1개만 출력) 해결
+- 프롬포트 오류(f-string) 및 모델 버전(3.8, 2.5) 변경 처리
+- 토큰 계산 오류 및 lsi 샘플 수 조정으로 서버 과부하 방지
+- 프론트엔드 화면 버그(보이지 않음, 충돌) 수정
+- GitHub 분석 시 빈 저장소 건너뛰기 로직 추가
+- 이메일 인증 포트 변경 및 Resend 기능 구현
+- CORS Vercel URL 추가 및 HTTPS 설정 최적화
+- AI 컬럼 구조 변경 및 저장 로직 개선(컬럼 상태 저장)"

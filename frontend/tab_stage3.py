@@ -229,7 +229,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
 
     # [3-3] AI 실행 영역
     st.divider()
-    st.subheader("3-3. 서브/종합 LLM 커스텀 · 템플릿 반영 설정 및 실시간 압축 실행")
+    st.subheader("3-3. 서브/종합 LLM 커스텀 프롬프트 설정 및 실시간 압축 실행")
 
     linked_tpl = analysis_data.get("template_config") or {
         "name": "기본 템플릿",
@@ -244,30 +244,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
     linked_sec = (linked_tpl.get("sections") or [{}])[0]
     linked_cols = linked_sec.get("columns") or []
 
-    with st.container(border=True):
-        st.markdown("**① 2단계 템플릿 연동 & 서브 LLM 반영 여부**")
-        t_col1, t_col2 = st.columns([2, 1])
-        with t_col1:
-            st.caption(
-                f"연동된 템플릿: **{linked_tpl.get('name', '-')}** · "
-                f"섹션: **{linked_sec.get('title') or linked_sec.get('section_title', '-')}**"
-            )
-            st.write("추출 컬럼:", ", ".join(f"`{c}`" for c in linked_cols) if linked_cols else "-")
-        with t_col2:
-            apply_template_in_sub = st.toggle(
-                "서브 LLM에 템플릿 반영",
-                value=True,
-                help=(
-                    "ON: 서브 LLM 단계에서 템플릿 컬럼명(target_columns)에 맞춰 근거를 압축합니다. (카드/섹션 미생성)\n"
-                    "OFF: 서브 LLM은 템플릿 없이 순수 기술 사실만 압축하고, 최종 종합 LLM에서만 템플릿 섹션과 카드를 생성합니다."
-                ),
-                key="ui_apply_tpl_in_sub",
-            )
-            st.caption(
-                "현재 모드: **컬럼 기준 압축 (ON)**"
-                if apply_template_in_sub
-                else "현재 모드: **순수 사실 보존 압축 (OFF)**"
-            )
+    apply_template_in_sub = False
 
     if "saved_sub_base_prompt" not in st.session_state:
         st.session_state["saved_sub_base_prompt"] = SUB_BASE_PROMPT_TEMPLATE
@@ -276,20 +253,6 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
     if "prompt_saved_at" not in st.session_state:
         st.session_state["prompt_saved_at"] = "초기 기본값"
 
-    sub_struct_with_tpl = json.dumps(
-        {
-            "target_columns": linked_cols,
-            "schema_on": {
-                "repo_name": "",
-                "target_author": "",
-                "tech_stacks": [],
-                "key_commits": [],
-                "key_prs_and_issues": [],
-                "column_evidence": {c: [] for c in linked_cols},
-            },
-        },
-        ensure_ascii=False,
-    )
     sub_struct_without_tpl = json.dumps(
         {
             "mode": "template_agnostic_pure_fact_compression",
@@ -303,8 +266,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
         },
         ensure_ascii=False,
     )
-    active_sub_struct_str = sub_struct_with_tpl if apply_template_in_sub else sub_struct_without_tpl
-    sub_struct_tokens = count_ui_tokens(active_sub_struct_str)
+    sub_struct_tokens = count_ui_tokens(sub_struct_without_tpl)
 
     primary_sec_preview = (linked_tpl.get("sections") or [{}])[0]
     example_cols_preview = primary_sec_preview.get("columns") or ["역할 및 구현", "기술 스택 및 근거"]
@@ -335,7 +297,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
     final_is_custom = st.session_state["saved_final_base_prompt"].strip() != FINAL_BASE_PROMPT_TEMPLATE.strip()
 
     expander_title = (
-        f"② 프롬프트 설정 — 명령(커스텀) vs 구조(고정 · 서브 {sub_total_fixed_tokens:,}tok / 종합 {final_total_fixed_tokens:,}tok) "
+        f"① 프롬프트 설정 — 명령(커스텀) vs 구조(고정 · 서브 {sub_total_fixed_tokens:,}tok / 종합 {final_total_fixed_tokens:,}tok) "
         f"[{'저장됨' if (sub_is_custom or final_is_custom) else '기본값'} · {st.session_state['prompt_saved_at']}]"
     )
 
@@ -344,7 +306,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
         p_col1, p_col2 = st.columns(2)
 
         with p_col1:
-            st.markdown("#### 서브 LLM 프롬프트 (컬럼 기준 데이터 압축 전용)")
+            st.markdown("#### 서브 LLM 프롬프트 (순수 사실 압축 전용)")
             draft_sub_prompt = st.text_area(
                 "서브 명령 프롬프트 (수정 가능)",
                 value=st.session_state["saved_sub_base_prompt"],
@@ -355,7 +317,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
             sub_has_unsaved = draft_sub_prompt.strip() != st.session_state["saved_sub_base_prompt"].strip()
 
             st.markdown("**🔒 서브 구조 프롬프트 (변경 불가 · 카드/섹션 미포함)**")
-            st.code(active_sub_struct_str, language="json")
+            st.code(sub_struct_without_tpl, language="json")
             st.markdown(
                 f"- **명령 프롬프트 토큰(저장 기준)**: `{sub_cmd_saved_tokens:,} tokens` (입력창 `{draft_sub_cmd_tok:,} tokens`)\n"
                 f"- **구조 프롬프트 토큰(고정 기본값)**: `{sub_struct_tokens:,} tokens`\n"
@@ -364,7 +326,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
             )
 
         with p_col2:
-            st.markdown("#### 종합 LLM 프롬프트 (저장소별 통합 & 카드 생성)")
+            st.markdown("#### 종합 LLM 프롬프트 (저장소별 통합 & 템플릿 카드 생성)")
             draft_final_prompt = st.text_area(
                 "종합 명령 프롬프트 (수정 가능)",
                 value=st.session_state["saved_final_base_prompt"],
@@ -429,7 +391,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
     custom_final_base_prompt = st.session_state["saved_final_base_prompt"]
 
     with st.container(border=True):
-        st.markdown("**③ 서브 LLM 전체 출력 한도 및 청크별 배분 설정**")
+        st.markdown("**② 서브 LLM 전체 출력 한도 및 청크별 배분 설정**")
         cfg_col1, cfg_col2 = st.columns(2)
         sub_alloc_mode = cfg_col1.radio(
             "청크별 서브 LLM 출력 한도 배분 방식",
@@ -516,7 +478,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
 
         try:
             with st.status(
-                f"총 {total_chunks}개 청크 실시간 서브 LLM 압축 중 (템플릿 반영: {'ON' if apply_template_in_sub else 'OFF'})...",
+                f"총 {total_chunks}개 청크 실시간 서브 LLM 압축 중...",
                 expanded=True,
             ) as status_box:
                 for idx, sp in enumerate(sub_prompts):
@@ -637,11 +599,6 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
                 "chunk_retentions": chunk_retentions,
             }
 
-            history_by_mode = dict(st.session_state.get("sub_tpl_mode_history") or {})
-            mode_key = "template_ON" if apply_template_in_sub else "template_OFF"
-            history_by_mode[mode_key] = run_summary
-            st.session_state["sub_tpl_mode_history"] = history_by_mode
-
             new_pipe = {
                 **pipe,
                 "sub_prompts": updated_sub_prompts,
@@ -665,43 +622,11 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
 
     u = pipe.get("token_usage", {})
     run_sum = pipe.get("sub_run_summary") or {}
-    u1, u2, u3, u4, u5 = st.columns(5)
+    u1, u2, u3, u4 = st.columns(4)
     u1.metric("사용 모델", pipe.get("model_used", "-"))
-    u2.metric("서브 템플릿 반영", "ON (반영)" if run_sum.get("apply_template_in_sub", True) else "OFF (미반영)")
-    u3.metric("서브 단계 데이터 보존율", f"{run_sum.get('sub_item_retention_pct', 0)}%")
-    u4.metric("서브 토큰 압축률", f"{run_sum.get('token_compression_pct', 0)}%")
-    u5.metric("실측 총 API 토큰", f"{u.get('total_tokens', 0):,}")
-
-    history_by_mode = st.session_state.get("sub_tpl_mode_history") or {}
-    if history_by_mode:
-        st.markdown("**④ 서브 LLM 템플릿 반영 여부에 따른 데이터 보존율 비교**")
-        on_rec = history_by_mode.get("template_ON")
-        off_rec = history_by_mode.get("template_OFF")
-
-        comp_rows = []
-        for label, rec in [("템플릿 반영 (ON)", on_rec), ("템플릿 미반영 (OFF)", off_rec)]:
-            if rec:
-                comp_rows.append({
-                    "모드": label,
-                    "배분 방식": "비례 배분" if rec.get("allocation_mode") == "proportional" else "공통 배분",
-                    "서브 압축 전→후 토큰": f"{rec.get('raw_sub_tokens', 0):,} → {rec.get('compressed_sub_tokens', 0):,}",
-                    "토큰 압축률(%)": rec.get("token_compression_pct", 0.0),
-                    "보존 항목 수": f"{rec.get('retained_items', 0)} / {rec.get('total_raw_items', 0)}개",
-                    "서브 데이터 보존율(%)": rec.get("sub_item_retention_pct", 0.0),
-                    "최종 종합 근거 반영률(%)": rec.get("final_mention_pct", 0.0),
-                })
-        st.dataframe(pd.DataFrame(comp_rows), width="stretch")
-
-        if on_rec and off_rec:
-            diff_ret = round(on_rec.get("sub_item_retention_pct", 0.0) - off_rec.get("sub_item_retention_pct", 0.0), 2)
-            diff_tok = on_rec.get("compressed_sub_tokens", 0) - off_rec.get("compressed_sub_tokens", 0)
-            st.info(
-                f"비교 결과: 템플릿 반영(ON)은 미반영(OFF) 대비 서브 단계 데이터 보존율이 "
-                f"**{diff_ret:+.2f}%p** 차이 나며, 압축 후 토큰은 **{diff_tok:+,} tokens** 차이가 발생했습니다."
-            )
-        else:
-            missing_label = "템플릿 미반영 (OFF)" if on_rec else "템플릿 반영 (ON)"
-            st.caption(f"💡 위 토글을 **{missing_label}**으로 바꾸어 한 번 더 실행하면 두 모드의 보존율 차이가 자동 비교됩니다.")
+    u2.metric("서브 단계 데이터 보존율", f"{run_sum.get('sub_item_retention_pct', 0)}%")
+    u3.metric("서브 토큰 압축률", f"{run_sum.get('token_compression_pct', 0)}%")
+    u4.metric("실측 총 API 토큰", f"{u.get('total_tokens', 0):,}")
 
     with st.expander("청크별 서브 LLM 압축 전/후 결과 및 보존율 상세 보기"):
         for idx, sp in enumerate(sub_prompts):
@@ -793,9 +718,25 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
         st.info("표로 변환할 생성 결과가 없습니다.")
 
     with st.container(border=True):
-        st.markdown("**③ 실험 결과 CSV 세트 저장 (4단계 '해석 및 분석' 탭 연동)**")
-        sv_c1, sv_c2 = st.columns([2, 1])
-        exp_label = sv_c1.text_input("실험 라벨 메모", placeholder="예: 비례배분_템플릿ON_한도2000", key="ui_exp_label")
-        if sv_c2.button("📥 CSV 4종 일괄 저장 (4단계 탭 분석용)", type="primary", width="stretch", key="btn_save_csv_all"):
-            saved_id = save_run_to_csvs(pipe=pipe, chunk_limit_mode=chunk_limit_mode, run_label=exp_label)
-            st.success(f"저장 완료 (`run_id: {saved_id}`) — 상단 **4단계 · 해석 및 분석** 탭에서 확인하세요.")
+        st.markdown("**③ 실험 결과 CSV 세트 저장 (`experiments/{프로젝트명}/` 격리 저장)**")
+        default_proj_name = (
+            (cleaned_all[0].get("repo_name") if cleaned_all and isinstance(cleaned_all[0], dict) else "")
+            or github_id
+            or "default_project"
+        )
+        sv_c1, sv_c2, sv_c3 = st.columns([1.2, 1.5, 1])
+        proj_folder_input = sv_c1.text_input(
+            "프로젝트 폴더명",
+            value=str(default_proj_name).split("/")[-1],
+            help="experiments/{프로젝트폴더명}/ 경로에 저장되어 다른 프로젝트 실험 데이터와 섞이지 않습니다.",
+            key="ui_exp_project_folder",
+        )
+        exp_label = sv_c2.text_input("실험 라벨 메모", placeholder="예: 청크3_토큰500_비례배분", key="ui_exp_label")
+        if sv_c3.button("📥 CSV 4종 일괄 저장", type="primary", width="stretch", key="btn_save_csv_all"):
+            saved_id, saved_proj = save_run_to_csvs(
+                pipe=pipe,
+                chunk_limit_mode=chunk_limit_mode,
+                run_label=exp_label,
+                project_name=proj_folder_input,
+            )
+            st.success(f"저장 완료: `experiments/{saved_proj}/` (`run_id: {saved_id}`)")
