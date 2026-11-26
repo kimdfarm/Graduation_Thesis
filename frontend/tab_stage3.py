@@ -105,7 +105,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
     col_opt2.checkbox("종합 프롬프트로 구조화 생성까지 실행", value=True, key="ui_run_generation")
     language = col_opt3.selectbox("출력 언어", options=["ko", "en"], index=0, key="ui_language")
 
-    if st.button("① 3-2 생 데이터 청크 분할 실행 (AI 미사용 · 즉시 확인)", type="primary", width="stretch", key="btn_run_chunk_only"):
+    if st.button("① 3-2 생 데이터 청크 분할 실행 (AI 사용전 · 즉시 확인)", type="primary", width="stretch", key="btn_run_chunk_only"):
         req_payload = {
             "analysis_data": analysis_data,
             "target_author": target_author_val or github_id,
@@ -146,7 +146,7 @@ def render_stage3(backend_url: str, github_id: str, start_date: Any, end_date: A
 
     # [3-2] AI 미사용 영역
     st.divider()
-    st.subheader("3-2. 생 데이터 정보 · 전처리 되는 정보 · 청크 분해된 정보 (AI 미사용)")
+    st.subheader("3-2. 생 데이터 정보 · 전처리 되는 정보 · 청크 분해된 정보 (AI 사용전)")
 
     raw_src_projects = analysis_data.get("projects_data") or [analysis_data]
     raw_src_tokens = count_ui_tokens(json.dumps(analysis_data, ensure_ascii=False))
